@@ -500,3 +500,47 @@ function retry_failed():
 - Every student has a status (`pending`, `sent`, `failed`) so we always know what worked
 - Failed emails are retried automatically
 - We can add more workers if we need to send faster
+
+## Stage 6
+
+### Approach
+
+The Priority Inbox needs to show the top N most important unread notifications. Importance is decided by two things:
+
+1. **Type weight** — Placement is most important, then Result, then Event
+2. **Recency** — newer notifications are more important than older ones
+
+I combined these into one comparable score:
+
+```
+type_weight: Placement = 3, Result = 2, Event = 1
+score = type_weight * 1e13 + timestamp_in_ms
+```
+
+The large multiplier on the type weight makes sure type always dominates. A Placement from yesterday will always rank higher than a Result from today, and within the same type the more recent one wins.
+
+### How to maintain top 10 efficiently when new notifications keep coming?
+
+The simple way would be to keep all notifications in a list and sort them every time a new one comes in. But this is O(N log N) where N is the total count, and gets slow when there are thousands of notifications.
+
+A much better approach is a **min-heap of size 10**:
+
+- The heap always holds exactly the current top 10 notifications
+- The smallest of those 10 is at the top of the heap (easy to access)
+- When a new notification arrives:
+  - If the heap has less than 10 items, just add it
+  - If the heap already has 10 items, compare the new one with the smallest:
+    - If the new one is bigger, pop the smallest and push the new one
+    - Otherwise ignore it
+- Each insert is O(log 10) which is basically constant time
+
+This works no matter how many total notifications exist — we never look at more than the heap of 10. In a real system this heap would live in memory or in a Redis sorted set per student, and the WebSocket event from Stage 1 would trigger an update whenever a new notification arrives.
+
+### Implementation
+
+The actual working code is in the `notification_app_be` folder:
+
+- `src/utils/MinHeap.js` — generic min-heap implementation
+- `src/services/priority.service.js` — scoring + top-N logic using the heap
+- `src/services/notification.service.js` — fetches notifications from the API
+- API endpoint: `GET /api/priority-inbox?n=10`
