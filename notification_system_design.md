@@ -396,3 +396,107 @@ Apply these together:
 2. Pagination so we never fetch everything
 3. WebSockets to push updates instead of repolling
 4. Read replicas if the load is still too high after these
+
+## Stage 5
+
+The given pseudocode:
+
+```
+function notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+### Problems with this code
+
+- It runs everything one student at a time. For 50,000 students this loop will take a very long time and the HR who clicked "Notify All" has to keep waiting.
+- There is no try/catch. If `send_email` fails for one student the whole loop crashes and the remaining students get nothing.
+- There is no retry. Email APIs sometimes fail because of timeouts or rate limits. The current code does not handle that.
+- The same message is saved to the DB 50,000 times. It would be better to save the message once and just link the students to it.
+- The DB save and the email sending are mixed together. If the email API is slow, even the database save becomes slow.
+- There is no way to know which students were successfully notified and which were not.
+
+### What about the 200 failed emails?
+
+The biggest issue is that we do not even know which 200 students failed, because the code does not store the status anywhere.
+
+To fix this we should keep a status column for each recipient (`pending`, `sent`, `failed`). Then when failures happen, we can find all rows with status `failed` and only retry those students. This way nobody gets the same email twice and nobody gets missed.
+
+### Should DB save and email happen together?
+
+No, they should be separated.
+
+- Saving to the DB is fast and we control it. This is the main thing that has to happen.
+- Sending email is slow, calls an external service, and can fail.
+
+If we mix them, a slow email API will slow down the database save too. And if the email step throws an error, the notification might never get saved.
+
+The right way is to save to the DB first, and then send the email as a separate background job.
+
+### Better design
+
+Use a **message queue** (like Redis Queue or RabbitMQ) and **background workers**.
+
+The flow becomes:
+
+1. The API saves the notification once and inserts the recipients in batches.
+2. The API puts email jobs and push jobs into a queue and returns immediately.
+3. Background workers pick up these jobs and send the emails/pushes one batch at a time.
+4. If a worker fails, the queue retries it after a delay.
+
+This way HR gets a quick response, the DB is not blocked by slow emails, and failures can be retried without affecting other students.
+
+### Revised pseudocode
+
+```
+# API endpoint - returns quickly
+function notify_all(student_ids, message, type):
+    notification_id = db.insert_notification(type, message)
+
+    for batch in chunks(student_ids, 1000):
+        db.insert_recipients_batch(notification_id, batch, status='pending')
+
+    for batch in chunks(student_ids, 500):
+        queue.add('email_job', { notification_id, students: batch })
+        queue.add('push_job',  { notification_id, students: batch })
+
+    return { notification_id, status: 'queued' }
+
+
+# Background email worker
+function email_worker(job):
+    for student_id in job.students:
+        try:
+            send_email(student_id, job.notification_id)
+            db.update_status(job.notification_id, student_id, 'sent')
+        catch error:
+            db.update_status(job.notification_id, student_id, 'failed')
+            # queue will retry this later
+
+
+# Background push worker
+function push_worker(job):
+    for student_id in job.students:
+        try:
+            websocket.push(student_id, job.notification_id)
+        catch error:
+            # push is best-effort, student will see it on next page load
+            log.warn("push failed for " + student_id)
+
+
+# Runs every few minutes to retry anything still failed
+function retry_failed():
+    failed = db.find_recipients_with_status('failed')
+    for batch in chunks(failed, 500):
+        queue.add('email_job', { students: batch })
+```
+
+### Why this is better
+
+- The API call returns in under a second instead of taking an hour
+- DB save and email send are separated, so a slow email API does not block anything
+- Every student has a status (`pending`, `sent`, `failed`) so we always know what worked
+- Failed emails are retried automatically
+- We can add more workers if we need to send faster
