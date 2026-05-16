@@ -258,3 +258,77 @@ RETURNING id;
 INSERT INTO notification_recipients (notification_id, student_id)
 SELECT $1, id FROM students;
 ```
+
+## Stage 3
+
+### Is the query accurate?
+
+The query gives the correct result (unread notifications for student 1042 in newest-first order), so it is logically fine. But it has some problems:
+
+- It uses `SELECT *` which pulls every column even when we only need a few
+- There is no `LIMIT`, so it returns all matching rows even if we only show 20 on the page
+- It depends on indexes to be fast, and as the database has grown to 5 million rows it is now slow
+
+### Why is it slow?
+
+With 5 million notifications and no proper index, the database has to scan through every row to find the ones where `studentID = 1042` and `isRead = false`. Even if only 30 rows match, the database still reads all 5 million to be sure. After that, it sorts the matching rows by `createdAt` which adds more time.
+
+So the cost is roughly proportional to the size of the table (`O(N)` where N is 5 million), not the number of rows the student actually has.
+
+### What I would change
+
+Add a composite index on the columns used in the WHERE and ORDER BY:
+
+```sql
+CREATE INDEX idx_notifications_student_unread
+ON notifications (studentID, isRead, createdAt DESC);
+```
+
+I would also rewrite the query to fetch only the columns the UI needs and add a LIMIT:
+
+```sql
+SELECT id, type, message, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = FALSE
+ORDER BY createdAt DESC
+LIMIT 20;
+```
+
+After this change the database can jump directly to student 1042's unread notifications using the index, instead of scanning the whole table. The cost becomes roughly `O(log N + K)` where K is the number of rows returned, which is very fast.
+
+### Should we add indexes on every column?
+
+No, this is bad advice. Indexes are not free.
+
+- Every index takes up extra disk space
+- Every INSERT, UPDATE and DELETE has to also update all the indexes, which makes writes slower
+- Indexes on columns that are never used in WHERE or ORDER BY are just dead weight
+- A single index on one column does not help when a query filters by multiple columns — for that we need composite indexes
+
+The right way is to look at the actual queries the application runs, figure out the common access patterns, and add indexes that support those specific queries.
+
+### Query: students who got a Placement notification in the last 7 days
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+If we need the student details too:
+
+```sql
+SELECT DISTINCT s.id, s.name, s.email
+FROM students s
+JOIN notifications n ON n.studentID = s.id
+WHERE n.notificationType = 'Placement'
+  AND n.createdAt >= NOW() - INTERVAL '7 days';
+```
+
+To make this fast we would also want an index like:
+
+```sql
+CREATE INDEX idx_notifications_type_created
+ON notifications (notificationType, createdAt DESC);
+```
