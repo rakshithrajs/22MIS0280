@@ -332,3 +332,67 @@ To make this fast we would also want an index like:
 CREATE INDEX idx_notifications_type_created
 ON notifications (notificationType, createdAt DESC);
 ```
+
+---
+
+## Stage 4
+
+The problem is that notifications are fetched on every page load. With many students browsing at the same time, the database is being hit a lot for data that hardly changes between two clicks. This is overwhelming the DB and giving a bad user experience.
+
+### Solutions
+
+#### 1. Add a caching layer (Redis)
+
+Store each student's recent notifications and their unread count in Redis. On a page load the server first checks Redis. If the data is there, return it directly. If not, fetch from the database and put it in Redis with a short TTL (say 60 seconds).
+
+When a notification is marked as read or a new one is created, we update or invalidate the cache so it stays correct.
+
+Tradeoffs:
+
+- **Pro:** Massively reduces DB load. Redis can handle these reads in microseconds.
+- **Con:** Need a cache invalidation strategy, otherwise students may see stale data. Adds another service to maintain.
+
+#### 2. Pagination + load on demand
+
+Right now everything is being fetched. Instead, only fetch the first 20 notifications. If the student scrolls or clicks "see more", then fetch the next 20.
+
+Tradeoffs:
+
+- **Pro:** Less data transferred and less work for the DB per request.
+- **Con:** Slightly more complex frontend logic for infinite scroll or pagination.
+
+#### 3. Use WebSockets instead of refetching on every page load
+
+Currently the page reloads the list every time. Instead, fetch once when the student opens the app, then keep the list updated through WebSocket events for new notifications and read updates.
+
+Tradeoffs:
+
+- **Pro:** The DB is only hit on first load, not on every action.
+- **Con:** WebSocket connections have to be managed (heartbeats, reconnects, scaling across servers).
+
+#### 4. Read replicas
+
+The main database (primary) handles writes, and one or more read replicas handle the reads. The notification listing API reads from the replica.
+
+Tradeoffs:
+
+- **Pro:** Scales reads horizontally without affecting writes.
+- **Con:** Replication has a small lag, so a notification that was just marked read might still show as unread for a second.
+
+#### 5. Cache the unread count separately
+
+The unread count is shown everywhere (bell icon) and is the most frequent query. Keep it in Redis as a simple counter per student. Increment when a new notification arrives, decrement on mark-as-read.
+
+Tradeoffs:
+
+- **Pro:** Constant time read regardless of how many notifications the student has.
+- **Con:** Need to make sure the counter stays in sync with the actual DB state (re-syncing periodically as a safety net).
+
+### My recommendation
+
+Apply these together:
+
+1. Redis cache for the notification list and unread count (biggest impact)
+2. Pagination so we never fetch everything
+3. WebSockets to push updates instead of repolling
+4. Read replicas if the load is still too high after these
