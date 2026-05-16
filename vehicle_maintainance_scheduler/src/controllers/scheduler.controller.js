@@ -1,4 +1,4 @@
-const { getDepots, getVehicles } = require("../services/externalApi.service");
+const { getDepots, getVehicles } = require("../services/external.service");
 const { scheduleForDepot } = require("../services/core.service");
 const { Log } = require("../utils/logger");
 

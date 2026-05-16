@@ -62,7 +62,6 @@ const Log = async (stack, log_level, package_name, message) => {
             },
             body: JSON.stringify(payload),
         });
-        console.log(response);
         return await response.json();
     } catch (error) {
         console.error(`[Logger] Error: ${error}`);

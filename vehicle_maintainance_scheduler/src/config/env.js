@@ -16,3 +16,5 @@ for (const key of required) {
         process.exit(1);
     }
 }
+
+module.exports = config;
